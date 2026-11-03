@@ -1,119 +1,398 @@
 import re
-import time
 import unicodedata
 from pathlib import Path
 
-import duckdb
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title='Buscador eleitoral | POC 2', page_icon='🔎', layout='wide')
-BASE = Path(__file__).parent / 'despesas_contratadas_candidatos_2026_AL.parquet'
-PREFERIDAS = ['NM_CANDIDATO', 'NR_CPF_CANDIDATO', 'NM_FORNECEDOR', 'NM_FORNECEDOR_RFB', 'NR_CPF_CNPJ_FORNECEDOR']
+st.set_page_config(
+    page_title='Buscador eleitoral | POC',
+    page_icon='🔎',
+    layout='wide'
+)
+
+BASE = Path(__file__).resolve().parent / 'despesas_contratadas_candidatos_2026_AL.parquet'
+
+PREFERIDAS = [
+    'NM_CANDIDATO',
+    'NR_CPF_CANDIDATO',
+    'NM_FORNECEDOR',
+    'NM_FORNECEDOR_RFB',
+    'NR_CPF_CNPJ_FORNECEDOR'
+]
+
+VAZIO = np.array([], dtype=np.int64)
 
 
 def normalizar(valor):
     if pd.isna(valor):
         return ''
-    s = unicodedata.normalize('NFKD', str(valor).strip().upper())
-    s = ''.join(c for c in s if not unicodedata.combining(c))
+
+    s = unicodedata.normalize(
+        'NFKD', str(valor).strip().upper()
+    )
+    s = ''.join(
+        c for c in s if not unicodedata.combining(c)
+    )
+
     if re.fullmatch(r'[\d.\-/\s]+', s):
         s = re.sub(r'\D', '', s)
+
     return s
 
 
+# Metadados: não carrega os registros
+@st.cache_data(show_spinner=False)
+def metadados():
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(BASE)
+    return (
+        pf.schema_arrow.names,
+        pf.metadata.num_rows
+    )
+
+
+# Base: carregada somente na primeira pesquisa
 @st.cache_data(show_spinner=False)
 def carregar_base():
-    inicio = time.perf_counter()
-    with duckdb.connect(database=':memory:') as con:
-        df = con.execute('SELECT * FROM read_parquet(?)', [str(BASE)]).df()
-    return df.fillna('').reset_index(drop=True), time.perf_counter() - inicio
+    import duckdb
+
+    con = duckdb.connect()
+    try:
+        cols = [
+            r[0] for r in con.execute(
+                'DESCRIBE SELECT * FROM read_parquet(?)',
+                [str(BASE)]
+            ).fetchall()
+        ]
+
+        sel = ', '.join(
+            'COALESCE(CAST("' +
+            c.replace('"', '""') +
+            '" AS VARCHAR), \'\') AS "' +
+            c.replace('"', '""') + '"'
+            for c in cols
+        )
+
+        df = con.execute(
+            f'SELECT {sel} FROM read_parquet(?)',
+            [str(BASE)]
+        ).df()
+
+        return df.reset_index(drop=True)
+    finally:
+        con.close()
 
 
-@st.cache_data(show_spinner=False)
-def preparar_colunas(_df, colunas, assinatura):
-    inicio = time.perf_counter()
-    return {campo: _df[campo].map(normalizar) for campo in colunas}, time.perf_counter() - inicio
+# Índices: construídos somente quando necessários
+@st.cache_resource(show_spinner=False)
+def indice_coluna(campo):
+    s = carregar_base()[campo]
+
+    mapa = {
+        valor: normalizar(valor)
+        for valor in s.unique()
+    }
+
+    norm = s.map(mapa)
+
+    return norm.groupby(
+        norm, sort=False
+    ).indices
 
 
-def corresponde(serie, termo, modo):
+def buscar(grupos, termo, modo):
     if modo == 'Exata':
-        return serie.eq(termo)
+        return grupos.get(termo, VAZIO)
+
     if modo == 'Contém trecho':
-        return serie.str.contains(termo, regex=False, na=False)
-    palavras = termo.split()
-    return pd.concat([serie.str.contains(p, regex=False, na=False) for p in palavras], axis=1).all(axis=1)
+        chaves = [
+            k for k in grupos
+            if termo in k
+        ]
+    else:
+        palavras = termo.split()
+        chaves = [
+            k for k in grupos
+            if all(p in k for p in palavras)
+        ]
+
+    if not chaves:
+        return VAZIO
+
+    return np.concatenate([
+        grupos[k] for k in chaves
+    ])
 
 
-st.title('🔎 Buscador de despesas eleitorais | POC 2')
-st.caption('Alagoas • Eleições 2026 • DuckDB + Parquet • Busca determinística, sem IA')
+# ---------------- INTERFACE ----------------
+
+st.title('🔎 Buscador de despesas eleitorais')
+
+st.caption(
+    'Prova de conceito • Alagoas • '
+    'Eleições 2026 • Busca textual sem IA'
+)
+
 if not BASE.is_file():
-    st.error('Arquivo Parquet não encontrado. Adicione despesas_contratadas_candidatos_2026_AL.parquet ao repositório.')
+    st.error(
+        'Arquivo da base não encontrado '
+        'na pasta do aplicativo.'
+    )
     st.stop()
 
 try:
-    base, tempo_leitura = carregar_base()
+    colunas, n_linhas = metadados()
 except Exception as exc:
-    st.error(f'Não foi possível ler a base: {exc}')
+    st.error(
+        f'Não foi possível ler os metadados: {exc}'
+    )
     st.stop()
 
-st.info(f'Base disponível: {len(base):,} registros e {len(base.columns)} colunas.'.replace(',', '.'))
-modo = st.radio('Tipo de correspondência', ['Exata', 'Contém trecho', 'Todas as palavras'], horizontal=True)
-campos = st.multiselect('Campos em que pesquisar', base.columns.tolist(), default=[c for c in PREFERIDAS if c in base.columns])
-entrada = st.text_area('Cole nomes, CPFs ou CNPJs (um por linha, separados por ; ou tab)', height=160, placeholder='EDILSON DE LIMA SANTOS\nSILVA\n123.456.789-01')
+st.info(
+    f'Base disponível: {n_linhas:,} registros '
+    f'e {len(colunas)} colunas.'.replace(',', '.')
+)
 
-with st.expander('Diagnóstico de desempenho'):
-    st.write(f'Leitura da base (primeira execução do cache): **{tempo_leitura:.3f} s**. Esta medida não inclui o despertar do servidor nem o carregamento do navegador.')
-    st.write(f'Tamanho do Parquet: **{BASE.stat().st_size / 1024 / 1024:.2f} MB**.')
+modo = st.radio(
+    'Tipo de correspondência',
+    ['Exata', 'Contém trecho', 'Todas as palavras'],
+    horizontal=True
+)
 
-if st.button('Buscar na base', type='primary', use_container_width=True):
+campos_padrao = [
+    c for c in PREFERIDAS if c in colunas
+]
+
+campos = st.multiselect(
+    'Campos em que pesquisar',
+    options=colunas,
+    default=campos_padrao
+)
+
+entrada = st.text_area(
+    'Cole nomes, CPFs ou CNPJs '
+    '(um por linha, separados por ; ou tab)',
+    height=190,
+    placeholder=(
+        'EDILSON DE LIMA SANTOS\n'
+        'SILVA\n'
+        '123.456.789-01'
+    )
+)
+
+
+# ---------------- BUSCA ----------------
+
+if st.button(
+    'Buscar na base',
+    type='primary',
+    use_container_width=True
+):
+    st.session_state.pop('res', None)
+
     if not campos:
-        st.warning('Selecione pelo menos uma coluna.')
+        st.warning(
+            'Selecione pelo menos uma coluna.'
+        )
         st.stop()
+
+    termos_originais = [
+        x.strip()
+        for x in re.split(r'[;\t\r\n]+', entrada)
+        if x.strip()
+    ]
+
     termos = {}
-    for original in (x.strip() for x in re.split(r'[;\t\r\n]+', entrada)):
+
+    for original in termos_originais:
         chave = normalizar(original)
         if chave:
             termos.setdefault(chave, original)
+
     if not termos:
-        st.warning('Informe pelo menos um termo.')
-        st.stop()
-    if len(termos) > 2000:
-        st.warning('Limite de 2.000 termos por consulta.')
+        st.warning(
+            'Cole pelo menos um nome, termo ou CPF/CNPJ.'
+        )
         st.stop()
 
-    inicio = time.perf_counter()
-    norm_cols, tempo_preparacao = preparar_colunas(base, tuple(campos), str(BASE.stat().st_mtime_ns))
-    partes = []
+    if len(termos) > 2000:
+        st.warning(
+            'Limite de 2.000 termos por consulta nesta POC.'
+        )
+        st.stop()
+
+    # Só agora os dados são carregados
+    try:
+        with st.spinner(
+            'Preparando a base (somente na primeira pesquisa)...'
+        ):
+            base = carregar_base()
+    except Exception as exc:
+        st.error(
+            f'Não foi possível carregar a base: {exc}'
+        )
+        st.stop()
+
+    linhas_idx = []
+    termos_col = []
+    campos_col = []
     encontrados = set()
-    with st.spinner('Pesquisando...'):
-        for campo, serie in norm_cols.items():
+
+    with st.spinner('Pesquisando na base...'):
+        for campo in campos:
+            grupos = indice_coluna(campo)
+
             for chave, original in termos.items():
-                indices = serie.index[corresponde(serie, chave, modo)]
-                if len(indices):
+                idx = buscar(grupos, chave, modo)
+
+                if len(idx):
                     encontrados.add(chave)
-                    partes.append(pd.DataFrame({'_linha': indices, 'termo_pesquisado': original, 'campo_encontrado': campo}))
-        if partes:
-            achados = pd.concat(partes, ignore_index=True)
-            resultado = pd.concat([achados[['termo_pesquisado', 'campo_encontrado']].reset_index(drop=True), base.iloc[achados['_linha'].to_numpy()].reset_index(drop=True)], axis=1)
+                    linhas_idx.append(idx)
+
+                    termos_col.append(
+                        np.full(
+                            len(idx), original, dtype=object
+                        )
+                    )
+
+                    campos_col.append(
+                        np.full(
+                            len(idx), campo, dtype=object
+                        )
+                    )
+
+        if linhas_idx:
+            idx_all = np.concatenate(linhas_idx)
+
+            resultado = pd.concat([
+                pd.DataFrame({
+                    'termo_pesquisado': np.concatenate(
+                        termos_col
+                    ),
+                    'campo_encontrado': np.concatenate(
+                        campos_col
+                    )
+                }),
+                base.iloc[idx_all].reset_index(
+                    drop=True
+                )
+            ], axis=1)
         else:
             resultado = pd.DataFrame()
-    tempo_busca = time.perf_counter() - inicio
-    ausentes = [v for k, v in termos.items() if k not in encontrados]
-    st.write(f'**Termos pesquisados:** {len(termos)} | **Correspondências:** {len(resultado)} | **Termos sem resultado:** {len(ausentes)}')
-    st.caption(f'Tempo da consulta: {tempo_busca:.3f} s. Preparação inicial de colunas: {tempo_preparacao:.3f} s (cache nas próximas consultas).')
+
+        ausentes = [
+            original
+            for chave, original in termos.items()
+            if chave not in encontrados
+        ]
+
+    st.session_state['res'] = {
+        'n_termos': len(termos),
+        'resultado': resultado,
+        'ausentes': ausentes,
+        'csv': (
+            resultado.to_csv(
+                index=False, sep=';'
+            ).encode('utf-8-sig')
+            if not resultado.empty else None
+        ),
+        'csv_aus': (
+            pd.DataFrame({
+                'termo_nao_encontrado': ausentes
+            }).to_csv(index=False).encode('utf-8-sig')
+            if ausentes else None
+        )
+    }
+
+
+# ---------------- RESULTADOS ----------------
+
+r = st.session_state.get('res')
+
+if r:
+    resultado = r['resultado']
+    ausentes = r['ausentes']
+
+    st.write(
+        f'**Termos pesquisados:** {r["n_termos"]}  |  '
+        f'**Correspondências:** {len(resultado)}  |  '
+        f'**Termos sem resultado:** {len(ausentes)}'
+    )
+
     if not resultado.empty:
         st.subheader('Resultados')
-        st.caption('Prévia das primeiras 100 correspondências. O CSV para download contém todos os resultados. Um registro pode aparecer mais de uma vez quando corresponde a diferentes termos ou campos.')
-        st.dataframe(resultado.head(100), use_container_width=True, hide_index=True)
-        st.download_button('Baixar todos os resultados CSV', resultado.to_csv(index=False, sep=';').encode('utf-8-sig'), file_name='resultados_busca.csv', mime='text/csv')
-    else:
-        st.info('Nenhuma correspondência encontrada.')
-    if ausentes:
-        with st.expander('Termos não encontrados'):
-            st.write('\n'.join(f'- {x}' for x in ausentes))
-            st.download_button('Baixar termos não encontrados', pd.DataFrame({'termo_nao_encontrado': ausentes}).to_csv(index=False).encode('utf-8-sig'), file_name='nao_encontrados.csv', mime='text/csv')
 
-with st.expander('Sobre a busca'):
-    st.write('Exata: igualdade integral. Contém trecho: sequência de caracteres. Todas as palavras: cada palavra deve estar presente, em qualquer ordem. Ignora acentos e diferenças entre maiúsculas/minúsculas. Para documentos numéricos, remove a pontuação. Não usa IA nem correspondência aproximada.')
-    st.write('Valores como -1 e -4 podem indicar ausência de informação, não documentos válidos. Os dados ficam no servidor.')
+        st.caption(
+            'Um registro pode aparecer mais de uma vez '
+            'quando corresponde a vários termos ou campos.'
+        )
+
+        # Exibe apenas as primeiras 100 correspondências
+        st.dataframe(
+            resultado.head(100),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            'Exibindo até 100 correspondências. '
+            'O arquivo CSV contém todos os resultados.'
+        )
+
+        st.download_button(
+            'Baixar resultados CSV',
+            data=r['csv'],
+            file_name='resultados_busca.csv',
+            mime='text/csv'
+        )
+    else:
+        st.info(
+            'Nenhuma correspondência encontrada '
+            'para os campos e o modo selecionados.'
+        )
+
+    if ausentes:
+        with st.expander('Ver termos não encontrados'):
+            st.write(
+                '\n'.join(f'- {t}' for t in ausentes)
+            )
+
+            st.download_button(
+                'Baixar termos não encontrados',
+                data=r['csv_aus'],
+                file_name='nao_encontrados.csv',
+                mime='text/csv'
+            )
+
+
+# ---------------- INFORMAÇÕES ----------------
+
+with st.expander('Sobre a busca e os dados'):
+    st.write(
+        'Exata: igualdade integral do campo. '
+        'Contém trecho: sequência de caracteres '
+        'em qualquer posição. '
+        'Todas as palavras: cada palavra deve '
+        'aparecer no campo, em qualquer ordem.'
+    )
+
+    st.write(
+        'As buscas ignoram diferenças entre '
+        'maiúsculas/minúsculas e acentos. '
+        'Documentos numéricos são comparados '
+        'sem pontuação.'
+    )
+
+    st.write(
+        'Valores especiais como -1 e -4 podem '
+        'aparecer na base e não devem ser '
+        'interpretados como CPF válido.'
+    )
+
+    st.write(
+        'A base permanece no servidor; '
+        'os usuários não precisam enviar arquivos.'
+    )
